@@ -10,6 +10,7 @@ import {
   MessageFlags,
   ModalBuilder,
   Partials,
+  PermissionFlagsBits,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
   TextInputBuilder,
@@ -50,7 +51,7 @@ const REQUIRED_ENV = [
 
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
-    console.error(`❌ Не заполнено поле ${key} в .env`);
+    console.error(`Не заполнено поле ${key} в .env`);
     process.exit(1);
   }
 }
@@ -71,10 +72,15 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
+async function getGuild(interaction) {
+  if (interaction.guild) return interaction.guild;
+  return client.guilds.fetch(CONFIG.guildId);
+}
+
 function hasHrRole(member) {
   return Boolean(
     member?.roles?.cache?.has(CONFIG.hrRoleId) ||
-    member?.permissions?.has('Administrator')
+    member?.permissions?.has(PermissionFlagsBits.Administrator)
   );
 }
 
@@ -91,9 +97,9 @@ function buildPanelPayload() {
         'Перед подачей заявки ознакомьтесь с условиями:',
         '',
         '• Для вступления в семью нужен **5+ уровень персонажа**.',
-        '• Необходимо иметь **адекватный средний онлайн**.',
+        '• Необходимо иметь **4+ часа среднего онлайна**.',
         '• Обязательно наличие **Discord** и готовность пройти обзвон.',
-        '• Заявки рассматриваются по мере возможности свободного HR.',
+        '• Заявки рассматриваются по мере возможности свободного Рекрутмента.',
         '',
         'Выберите действие ниже, чтобы открыть анкету.'
       ].join('\n')
@@ -108,7 +114,12 @@ function buildPanelPayload() {
         .setLabel('Подать заявку в семью')
         .setDescription(`Открыть анкету для вступления в ${CONFIG.familyName}`)
         .setEmoji('📝')
-        .setValue('apply')
+        .setValue('apply'),
+      new StringSelectMenuOptionBuilder()
+        .setLabel('Другой выбор')
+        .setDescription('Сбросить выбор')
+        .setEmoji('↩️')
+        .setValue('reset')
     );
 
   return {
@@ -125,7 +136,7 @@ function buildApplyModal() {
   const gameInfo = new TextInputBuilder()
     .setCustomId('game_info')
     .setLabel('Игровой ник + уровень персонажа')
-    .setPlaceholder('Например: Artem Monroe, 15 lvl')
+    .setPlaceholder('Например: Spartak Monroe, 15 lvl')
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setMaxLength(100);
@@ -133,7 +144,7 @@ function buildApplyModal() {
   const ageOnline = new TextInputBuilder()
     .setCustomId('age_online')
     .setLabel('Возраст + средний онлайн')
-    .setPlaceholder('Например: 16 лет, 4 часа в день')
+    .setPlaceholder('Например: 25 лет, 4 часа в день')
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setMaxLength(100);
@@ -141,7 +152,7 @@ function buildApplyModal() {
   const previousFamilies = new TextInputBuilder()
     .setCustomId('previous_families')
     .setLabel('В каких семьях / организациях состояли?')
-    .setPlaceholder('Например: Mist, Cursed, Healz / не состоял')
+    .setPlaceholder('Например: Castairs, Cursed, Ethereal / не состоял')
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
     .setMaxLength(700);
@@ -176,11 +187,11 @@ function buildApplyModal() {
 function buildReviewEmbed({ applicant, answers }) {
   return new EmbedBuilder()
     .setColor(CONFIG.accentColor)
-    .setTitle('📝 Новая заявка в семью')
+    .setTitle('Новая заявка в семью')
     .setDescription(
       [
         `**Кандидат:** ${applicant}`,
-        `**Discord ID:** \`${applicant.id}\``,
+        `**Discord ID:** \`${applicant.id}\`` ,
         `**Дата подачи:** <t:${Math.floor(Date.now() / 1000)}:f>`
       ].join('\n')
     )
@@ -230,7 +241,7 @@ function buildReviewButtons(applicantId, disabled = false) {
     new ButtonBuilder()
       .setCustomId(`${IDS.rejectPrefix}${applicantId}`)
       .setLabel('Отклонить')
-      .setEmoji('❌')
+      .setEmoji('✖️')
       .setStyle(ButtonStyle.Danger)
       .setDisabled(disabled)
   );
@@ -238,7 +249,7 @@ function buildReviewButtons(applicantId, disabled = false) {
 
 function buildResultEmbed({ accepted, applicantId, reviewerId, reason }) {
   const color = accepted ? 0x57F287 : 0xED4245;
-  const title = accepted ? '✅ Заявка принята' : '❌ Заявка отклонена';
+  const title = accepted ? '✅ Заявка принята' : '✖️ Заявка отклонена';
 
   const lines = [
     `**Кандидат:** <@${applicantId}>`,
@@ -266,7 +277,7 @@ function buildUpdatedReviewEmbed(oldEmbed, { accepted, reviewerId, reason }) {
 
   const statusValue = accepted
     ? `✅ Принято\n**Рассмотрел:** <@${reviewerId}>`
-    : `❌ Отклонено\n**Рассмотрел:** <@${reviewerId}>\n**Причина:** ${reason || 'Не указана.'}`;
+    : `✖️ Отклонено\n**Рассмотрел:** <@${reviewerId}>\n**Причина:** ${reason || 'Не указана.'}`;
 
   const fields = oldEmbed.fields.map((field) => {
     if (field.name === 'Статус') {
@@ -311,16 +322,16 @@ async function approveApplication(interaction, applicantId) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   if (!hasHrRole(interaction.member)) {
-    await interaction.editReply('❌ У тебя нет прав HR для рассмотрения заявок.');
+    await interaction.editReply('У тебя нет прав Рекрутмента для рассмотрения заявок.');
     return;
   }
 
-  const guild = interaction.guild;
+  const guild = await getGuild(interaction);
   const reviewMessageId = interaction.message.id;
 
   const application = await getApplication(reviewMessageId);
   if (application?.status && application.status !== 'pending') {
-    await interaction.editReply('⚠️ Эта заявка уже была рассмотрена.');
+    await interaction.editReply('Эта заявка уже была рассмотрена.');
     return;
   }
 
@@ -328,7 +339,7 @@ async function approveApplication(interaction, applicantId) {
 
   try {
     const member = await guild.members.fetch(applicantId);
-    await member.roles.add(CONFIG.candidateRoleId, `Заявка принята HR: ${interaction.user.tag}`);
+    await member.roles.add(CONFIG.candidateRoleId, `Заявка принята, рекрутмент: ${interaction.user.tag}`);
     roleGiven = true;
   } catch (error) {
     console.error('Не удалось выдать роль кандидата:', error);
@@ -361,8 +372,8 @@ async function approveApplication(interaction, applicantId) {
 
   await interaction.editReply(
     roleGiven
-      ? '✅ Заявка принята. Роль кандидата выдана, результат отправлен.'
-      : '✅ Заявка принята, результат отправлен. ⚠️ Но роль кандидата выдать не удалось — проверь права и позицию роли бота.'
+      ? 'Заявка принята. Роль кандидата выдана, результат отправлен.'
+      : 'Заявка принята, результат отправлен. Но роль кандидата выдать не удалось — проверь права и позицию роли бота.'
   );
 }
 
@@ -387,18 +398,18 @@ async function rejectApplication(interaction, applicantId, reviewMessageId, reas
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   if (!hasHrRole(interaction.member)) {
-    await interaction.editReply('❌ У тебя нет прав HR для рассмотрения заявок.');
+    await interaction.editReply('У тебя нет прав Рекрутмента для рассмотрения заявок.');
     return;
   }
 
-  const guild = interaction.guild;
+  const guild = await getGuild(interaction);
 
   const reviewChannel = await guild.channels.fetch(CONFIG.reviewChannelId);
   const reviewMessage = await reviewChannel.messages.fetch(reviewMessageId);
 
   const application = await getApplication(reviewMessageId);
   if (application?.status && application.status !== 'pending') {
-    await interaction.editReply('⚠️ Эта заявка уже была рассмотрена.');
+    await interaction.editReply('Эта заявка уже была рассмотрена.');
     return;
   }
 
@@ -429,29 +440,30 @@ async function rejectApplication(interaction, applicantId, reviewMessageId, reas
     reason
   });
 
-  await interaction.editReply('❌ Заявка отклонена, результат отправлен.');
+  await interaction.editReply('Заявка отклонена, результат отправлен.');
 }
 
 client.once('ready', () => {
-  console.log(`✅ Бот запущен как ${client.user.tag}`);
+  console.log(`Бот запущен как ${client.user.tag}`);
 });
 
 client.on('interactionCreate', async (interaction) => {
   try {
-    if (interaction.isChatInputCommand() && interaction.commandName === 'setup-applications') {
-      if (!interaction.memberPermissions?.has('Administrator')) {
+    if (interaction.isChatInputCommand() && interaction.commandName === 'setup') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
         await interaction.reply({
-          content: '❌ Эту команду может использовать только администратор.',
+          content: 'Эту команду может использовать только администратор.',
           flags: MessageFlags.Ephemeral
         });
         return;
       }
 
-      const channel = await interaction.guild.channels.fetch(CONFIG.panelChannelId);
+      const guild = await getGuild(interaction);
+      const channel = await guild.channels.fetch(CONFIG.panelChannelId);
 
       if (!channel || channel.type !== ChannelType.GuildText) {
         await interaction.reply({
-          content: '❌ Канал для панели заявок не найден или не является текстовым.',
+          content: 'Канал для панели заявок не найден или не является текстовым.',
           flags: MessageFlags.Ephemeral
         });
         return;
@@ -460,7 +472,7 @@ client.on('interactionCreate', async (interaction) => {
       await channel.send(buildPanelPayload());
 
       await interaction.reply({
-        content: `✅ Панель подачи заявок отправлена в ${channel}.`,
+        content: `Панель подачи заявок отправлена в ${channel}.`,
         flags: MessageFlags.Ephemeral
       });
 
@@ -468,8 +480,19 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === IDS.selectApply) {
-      if (interaction.values[0] !== 'apply') return;
-      await interaction.showModal(buildApplyModal());
+      const choice = interaction.values[0];
+
+      if (choice === 'reset') {
+        await interaction.deferUpdate();
+        return;
+      }
+
+      if (choice === 'apply') {
+        await interaction.showModal(buildApplyModal());
+        return;
+      }
+
+      await interaction.deferUpdate();
       return;
     }
 
@@ -484,10 +507,11 @@ client.on('interactionCreate', async (interaction) => {
         source: interaction.fields.getTextInputValue('source')
       };
 
-      const reviewChannel = await interaction.guild.channels.fetch(CONFIG.reviewChannelId);
+      const guild = await getGuild(interaction);
+      const reviewChannel = await guild.channels.fetch(CONFIG.reviewChannelId);
 
       if (!reviewChannel || reviewChannel.type !== ChannelType.GuildText) {
-        await interaction.editReply('❌ Канал для рассмотрения заявок не найден.');
+        await interaction.editReply('Канал для рассмотрения заявок не найден.');
         return;
       }
 
@@ -513,7 +537,7 @@ client.on('interactionCreate', async (interaction) => {
       });
 
       await interaction.editReply(
-        '✅ Заявка отправлена на рассмотрение. Ожидайте решения HR.'
+        'Заявка отправлена на рассмотрение. Ожидайте решения Рекрутмента.'
       );
 
       return;
@@ -528,7 +552,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith(IDS.rejectPrefix)) {
       if (!hasHrRole(interaction.member)) {
         await interaction.reply({
-          content: '❌ У тебя нет прав HR для рассмотрения заявок.',
+          content: 'У тебя нет прав Рекрутмента для рассмотрения заявок.',
           flags: MessageFlags.Ephemeral
         });
         return;
@@ -548,9 +572,9 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
   } catch (error) {
-    console.error('❌ Ошибка обработки interaction:', error);
+    console.error('Ошибка обработки interaction:', error);
 
-    const message = '❌ Произошла ошибка. Проверь консоль бота и настройки каналов/ролей.';
+    const message = 'Произошла ошибка. Проверь консоль бота и настройки каналов/ролей.';
 
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply(message).catch(() => {});
