@@ -11,6 +11,7 @@ import {
   ModalBuilder,
   Partials,
   PermissionFlagsBits,
+  Routes,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
   TextInputBuilder,
@@ -20,7 +21,10 @@ import {
 import {
   saveApplication,
   updateApplication,
-  getApplication
+  getApplication,
+  countPendingApplicationsByApplicant,
+  getSettings,
+  updateSettings
 } from './db.js';
 
 const CONFIG = {
@@ -29,10 +33,15 @@ const CONFIG = {
   panelChannelId: process.env.APPLICATION_PANEL_CHANNEL_ID,
   reviewChannelId: process.env.APPLICATION_REVIEW_CHANNEL_ID,
   resultChannelId: process.env.APPLICATION_RESULT_CHANNEL_ID,
+  humanLogChannelId: process.env.HUMAN_LOG_CHANNEL_ID,
+  adminConsoleChannelId: process.env.ADMIN_CONSOLE_CHANNEL_ID,
   candidateRoleId: process.env.CANDIDATE_ROLE_ID,
   hrRoleId: process.env.HR_ROLE_ID,
-  bannerUrl: process.env.APPLICATION_BANNER_URL,
+  openBannerUrl: process.env.APPLICATION_OPEN_BANNER_URL || process.env.APPLICATION_BANNER_URL,
+  closedBannerUrl: process.env.APPLICATION_CLOSED_BANNER_URL || process.env.APPLICATION_BANNER_URL,
   accentColor: Number(process.env.ACCENT_COLOR || 2368553),
+  maxPendingApplications: Number(process.env.MAX_PENDING_APPLICATIONS || 3),
+  spamScoreLimit: Number(process.env.SPAM_SCORE_LIMIT || 4),
   familyName: process.env.FAMILY_NAME || 'Monroe Family',
   serverName: process.env.SERVER_NAME || 'MONROE FAMQ',
   footerText: process.env.FOOTER_TEXT || 'Monroe FamQ • Recruitment System'
@@ -44,6 +53,8 @@ const REQUIRED_ENV = [
   'APPLICATION_PANEL_CHANNEL_ID',
   'APPLICATION_REVIEW_CHANNEL_ID',
   'APPLICATION_RESULT_CHANNEL_ID',
+  'HUMAN_LOG_CHANNEL_ID',
+  'ADMIN_CONSOLE_CHANNEL_ID',
   'CANDIDATE_ROLE_ID',
   'HR_ROLE_ID',
   'APPLICATION_BANNER_URL'
@@ -61,7 +72,10 @@ const IDS = {
   modalApply: 'mfq_apply_modal',
   approvePrefix: 'mfq_apply_approve:',
   rejectPrefix: 'mfq_apply_reject:',
-  rejectReasonPrefix: 'mfq_apply_reject_reason:'
+  rejectReasonPrefix: 'mfq_apply_reject_reason:',
+  openApplications: 'mfq_admin_open_applications',
+  closeApplications: 'mfq_admin_close_applications',
+  refreshPanel: 'mfq_admin_refresh_panel'
 };
 
 const client = new Client({
@@ -84,16 +98,141 @@ function hasHrRole(member) {
   );
 }
 
-function buildPanelPayload() {
-  const bannerEmbed = new EmbedBuilder()
-    .setColor(CONFIG.accentColor)
-    .setImage(CONFIG.bannerUrl);
+function truncateText(value, max = 900) {
+  const text = String(value || '').trim();
+  if (text.length <= max) return text || '—';
+  return `${text.slice(0, max - 3)}...`;
+}
 
-  const infoEmbed = new EmbedBuilder()
-    .setColor(CONFIG.accentColor)
-    .setTitle(`Заявки в ${CONFIG.familyName} открыты!`)
-    .setDescription(
-      [
+function hasManageAccess(member) {
+  return Boolean(
+    member?.roles?.cache?.has(CONFIG.hrRoleId) ||
+    member?.permissions?.has(PermissionFlagsBits.Administrator)
+  );
+}
+
+function detectSpam(answers) {
+  const values = Object.values(answers).map((value) => String(value || '').trim());
+  const joined = values.join('\n').trim();
+  const compact = joined.replace(/\s+/g, '');
+  const lower = joined.toLowerCase();
+
+  let score = 0;
+  const reasons = [];
+
+  if (joined.length < 45) {
+    score += 2;
+    reasons.push('слишком короткие ответы');
+  }
+
+  const letters = joined.match(/\p{L}/gu) || [];
+  if (letters.length < 18) {
+    score += 2;
+    reasons.push('очень мало нормального текста');
+  }
+
+  if (/(.)\1{7,}/iu.test(compact)) {
+    score += 3;
+    reasons.push('много повторяющихся символов');
+  }
+
+  if (/https?:\/\/|discord\.gg|discord\.com\/invite/iu.test(lower)) {
+    score += 3;
+    reasons.push('обнаружена ссылка или инвайт');
+  }
+
+  if (/(qwerty|asdf|zxcv|йцук|фыва|олдж|ячсм|123456|abcdef)/iu.test(lower)) {
+    score += 2;
+    reasons.push('похоже на набор случайных клавиш');
+  }
+
+  const symbols = joined.match(/[^\p{L}\p{N}\s.,!?()+\-:;'"«»]/gu) || [];
+  if (joined.length > 0 && symbols.length / joined.length > 0.35) {
+    score += 2;
+    reasons.push('слишком много спецсимволов');
+  }
+
+  const normalizedFields = values
+    .map((value) => value.toLowerCase().replace(/\s+/g, ' '))
+    .filter(Boolean);
+  if (normalizedFields.length >= 3 && new Set(normalizedFields).size <= 2) {
+    score += 2;
+    reasons.push('поля анкеты почти одинаковые');
+  }
+
+  const words = lower.match(/[\p{L}\p{N}]{2,}/gu) || [];
+  if (words.length >= 8) {
+    const counts = new Map();
+    for (const word of words) counts.set(word, (counts.get(word) || 0) + 1);
+    const maxRepeat = Math.max(...counts.values());
+    if (maxRepeat >= Math.max(5, Math.ceil(words.length * 0.45))) {
+      score += 2;
+      reasons.push('одно и то же слово повторяется слишком часто');
+    }
+  }
+
+  return {
+    score,
+    reasons,
+    isSpam: score >= CONFIG.spamScoreLimit
+  };
+}
+
+async function logHumanEvent({ title, description, fields = [], color = 0xFEE75C }) {
+  if (!CONFIG.humanLogChannelId) return;
+
+  try {
+    const guild = await client.guilds.fetch(CONFIG.guildId);
+    const channel = await guild.channels.fetch(CONFIG.humanLogChannelId);
+
+    if (!channel || channel.type !== ChannelType.GuildText) return;
+
+    const embed = new EmbedBuilder()
+      .setColor(color)
+      .setTitle(title)
+      .setDescription(description || null)
+      .setTimestamp()
+      .setFooter({ text: CONFIG.footerText });
+
+    if (fields.length) embed.addFields(fields);
+
+    await channel.send({
+      embeds: [embed],
+      allowedMentions: { users: [], roles: [] }
+    });
+  } catch (error) {
+    console.error('Не удалось отправить human-log:', error);
+  }
+}
+
+async function refreshPanelMessage() {
+  const settings = await getSettings();
+
+  if (!settings.panelChannelId || !settings.panelMessageId) {
+    return false;
+  }
+
+  try {
+    await client.rest.patch(
+      Routes.channelMessage(settings.panelChannelId, settings.panelMessageId),
+      { body: await buildPanelPayload() }
+    );
+    return true;
+  } catch (error) {
+    console.error('Не удалось обновить панель заявок:', error);
+    return false;
+  }
+}
+
+async function buildPanelPayload() {
+  const settings = await getSettings();
+  const isOpen = settings.applicationsOpen !== false;
+  const bannerUrl = isOpen ? CONFIG.openBannerUrl : CONFIG.closedBannerUrl;
+
+  const textBlock = isOpen
+    ? [
+        `## Заявки в ${CONFIG.familyName} открыты!`,
+        '',
         'Перед подачей заявки ознакомьтесь с условиями:',
         '',
         '• Для вступления в семью нужен **5+ уровень персонажа**.',
@@ -101,30 +240,123 @@ function buildPanelPayload() {
         '• Обязательно наличие **Discord** и готовность пройти обзвон.',
         '• Заявки рассматриваются по мере возможности свободного Рекрутмента.',
         '',
-        'Выберите действие ниже, чтобы открыть анкету.'
+        'Выберите действие ниже, чтобы открыть анкету.',
+        '',
+        `-# ${CONFIG.footerText}`
       ].join('\n')
-    )
-    .setFooter({ text: CONFIG.footerText });
-
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(IDS.selectApply)
-    .setPlaceholder('Выбери действие')
-    .addOptions(
-      new StringSelectMenuOptionBuilder()
-        .setLabel('Подать заявку в семью')
-        .setDescription(`Открыть анкету для вступления в ${CONFIG.familyName}`)
-        .setEmoji('📝')
-        .setValue('apply'),
-      new StringSelectMenuOptionBuilder()
-        .setLabel('Другой выбор')
-        .setDescription('Сбросить выбор')
-        .setEmoji('↩️')
-        .setValue('reset')
-    );
+    : [
+        `## Заявки в ${CONFIG.familyName} временно закрыты`,
+        '',
+        'Сейчас набор в семью приостановлен.',
+        '',
+        'Следите за обновлениями в этом канале — когда заявки снова откроются, здесь появится активная форма подачи.',
+        '',
+        `-# ${CONFIG.footerText}`
+      ].join('\n');
 
   return {
-    embeds: [bannerEmbed, infoEmbed],
-    components: [new ActionRowBuilder().addComponents(menu)]
+    flags: 32768,
+    components: [
+      {
+        type: 17,
+        accent_color: CONFIG.accentColor,
+        components: [
+          {
+            type: 12,
+            items: [
+              {
+                media: {
+                  url: bannerUrl
+                }
+              }
+            ]
+          },
+          {
+            type: 10,
+            content: textBlock
+          },
+          {
+            type: 14,
+            spacing: 1,
+            divider: true
+          },
+          {
+            type: 1,
+            components: [
+              {
+                type: 3,
+                custom_id: IDS.selectApply,
+                placeholder: isOpen ? 'Подать заявку в семью' : 'Заявки закрыты',
+                disabled: !isOpen,
+                options: [
+                  {
+                    label: 'Подать заявку в семью',
+                    description: `Открыть анкету для вступления в ${CONFIG.familyName}`,
+                    emoji: { name: '📝' },
+                    value: 'apply'
+                  },
+                  {
+                    label: 'Другой выбор',
+                    description: 'Сбросить выбор',
+                    emoji: { name: '↩️' },
+                    value: 'reset'
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function buildAdminConsolePayload(settings) {
+  const isOpen = settings.applicationsOpen !== false;
+  const statusText = isOpen
+    ? '🟢 **Заявки сейчас открыты.** Кандидаты могут заполнять форму.'
+    : '🔴 **Заявки сейчас закрыты.** Кандидаты не могут отправлять новые анкеты.';
+
+  const embed = new EmbedBuilder()
+    .setColor(isOpen ? 0x57F287 : 0xED4245)
+    .setTitle('Панель управления заявками')
+    .setDescription(
+      [
+        statusText,
+        '',
+        '**Действия:**',
+        '• `Открыть заявки` — включает форму и ставит баннер открытого набора.',
+        '• `Закрыть заявки` — отключает форму и ставит баннер закрытого набора.',
+        '• `Обновить панель` — вручную перерисовывает сообщение в канале заявок.',
+        '',
+        `-# ${CONFIG.footerText}`
+      ].join('\n')
+    )
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(IDS.openApplications)
+      .setLabel('Открыть заявки')
+      .setEmoji('🟢')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(isOpen),
+    new ButtonBuilder()
+      .setCustomId(IDS.closeApplications)
+      .setLabel('Закрыть заявки')
+      .setEmoji('🔴')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(!isOpen),
+    new ButtonBuilder()
+      .setCustomId(IDS.refreshPanel)
+      .setLabel('Обновить панель')
+      .setEmoji('🔄')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return {
+    embeds: [embed],
+    components: [row]
   };
 }
 
@@ -469,10 +701,48 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      await channel.send(buildPanelPayload());
+      const panelMessage = await client.rest.post(Routes.channelMessages(channel.id), {
+        body: await buildPanelPayload()
+      });
+
+      await updateSettings({
+        panelChannelId: channel.id,
+        panelMessageId: panelMessage.id
+      });
 
       await interaction.reply({
         content: `Панель подачи заявок отправлена в ${channel}.`,
+        flags: MessageFlags.Ephemeral
+      });
+
+      return;
+    }
+
+    if (interaction.isChatInputCommand() && interaction.commandName === 'console') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+        await interaction.reply({
+          content: 'Эту команду может использовать только администратор.',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      const guild = await getGuild(interaction);
+      const channel = await guild.channels.fetch(CONFIG.adminConsoleChannelId);
+
+      if (!channel || channel.type !== ChannelType.GuildText) {
+        await interaction.reply({
+          content: 'Канал админ-консоли не найден или не является текстовым.',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      const settings = await getSettings();
+      await channel.send(buildAdminConsolePayload(settings));
+
+      await interaction.reply({
+        content: `Админ-консоль заявок отправлена в ${channel}.`,
         flags: MessageFlags.Ephemeral
       });
 
@@ -488,6 +758,15 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (choice === 'apply') {
+        const settings = await getSettings();
+        if (settings.applicationsOpen === false) {
+          await interaction.reply({
+            content: '🔴 Заявки сейчас закрыты. Следите за обновлениями в канале заявок.',
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+
         await interaction.showModal(buildApplyModal());
         return;
       }
@@ -506,6 +785,54 @@ client.on('interactionCreate', async (interaction) => {
         whyFamily: interaction.fields.getTextInputValue('why_family'),
         source: interaction.fields.getTextInputValue('source')
       };
+
+      const settings = await getSettings();
+      if (settings.applicationsOpen === false) {
+        await interaction.editReply('🔴 Заявки сейчас закрыты. Новые анкеты временно не принимаются.');
+        return;
+      }
+
+      const pendingCount = await countPendingApplicationsByApplicant(interaction.user.id);
+      if (pendingCount >= CONFIG.maxPendingApplications) {
+        await logHumanEvent({
+          title: '⚠️ Анти-спам: превышен лимит заявок',
+          description: `Пользователь ${interaction.user} попытался отправить новую заявку, но у него уже **${pendingCount}** активных заявок.`,
+          color: 0xFEE75C,
+          fields: [
+            { name: 'Discord ID', value: `\`${interaction.user.id}\``, inline: false },
+            { name: 'Лимит', value: `${CONFIG.maxPendingApplications} активные заявки`, inline: true }
+          ]
+        });
+
+        await interaction.editReply(
+          `⚠️ У вас уже есть ${pendingCount} активных заявок. Дождитесь решения Рекрутмента перед новой подачей.`
+        );
+        return;
+      }
+
+      const spamCheck = detectSpam(answers);
+      if (spamCheck.isSpam) {
+        await logHumanEvent({
+          title: '🚨 Анти-спам: заявка заблокирована',
+          description: `Система заблокировала подозрительную заявку от ${interaction.user}.`,
+          color: 0xED4245,
+          fields: [
+            { name: 'Discord ID', value: `\`${interaction.user.id}\``, inline: false },
+            { name: 'Spam score', value: `${spamCheck.score}/${CONFIG.spamScoreLimit}`, inline: true },
+            { name: 'Причины', value: spamCheck.reasons.join('\n') || '—', inline: false },
+            { name: 'Игровой ник + уровень', value: truncateText(answers.gameInfo, 500), inline: false },
+            { name: 'Возраст + онлайн', value: truncateText(answers.ageOnline, 500), inline: false },
+            { name: 'Опыт', value: truncateText(answers.previousFamilies, 700), inline: false },
+            { name: 'Почему хочет вступить', value: truncateText(answers.whyFamily, 700), inline: false },
+            { name: 'Откуда узнал', value: truncateText(answers.source, 500), inline: false }
+          ]
+        });
+
+        await interaction.editReply(
+          '⚠️ Заявка не отправлена: система защиты посчитала ответы подозрительными. Заполните анкету нормально и без спама.'
+        );
+        return;
+      }
 
       const guild = await getGuild(interaction);
       const reviewChannel = await guild.channels.fetch(CONFIG.reviewChannelId);
@@ -541,6 +868,58 @@ client.on('interactionCreate', async (interaction) => {
       );
 
       return;
+    }
+
+    if (
+      interaction.isButton() &&
+      [IDS.openApplications, IDS.closeApplications, IDS.refreshPanel].includes(interaction.customId)
+    ) {
+      if (!hasManageAccess(interaction.member)) {
+        await interaction.reply({
+          content: 'У тебя нет прав для управления заявками.',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      if (interaction.customId === IDS.openApplications) {
+        await updateSettings({ applicationsOpen: true });
+        const panelUpdated = await refreshPanelMessage();
+        const settings = await getSettings();
+        await interaction.update(buildAdminConsolePayload(settings));
+        await logHumanEvent({
+          title: '🟢 Заявки открыты',
+          description: `${interaction.user} открыл заявки через админ-консоль.\nПанель заявок обновлена: **${panelUpdated ? 'да' : 'нет'}**.`,
+          color: 0x57F287
+        });
+        return;
+      }
+
+      if (interaction.customId === IDS.closeApplications) {
+        await updateSettings({ applicationsOpen: false });
+        const panelUpdated = await refreshPanelMessage();
+        const settings = await getSettings();
+        await interaction.update(buildAdminConsolePayload(settings));
+        await logHumanEvent({
+          title: '🔴 Заявки закрыты',
+          description: `${interaction.user} закрыл заявки через админ-консоль.\nПанель заявок обновлена: **${panelUpdated ? 'да' : 'нет'}**.`,
+          color: 0xED4245
+        });
+        return;
+      }
+
+      if (interaction.customId === IDS.refreshPanel) {
+        const panelUpdated = await refreshPanelMessage();
+        const settings = await getSettings();
+        await interaction.update(buildAdminConsolePayload(settings));
+        await interaction.followUp({
+          content: panelUpdated
+            ? '✅ Панель заявок обновлена.'
+            : '⚠️ Не нашёл сохранённое сообщение панели. Сначала выполните `/setup`.',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
     }
 
     if (interaction.isButton() && interaction.customId.startsWith(IDS.approvePrefix)) {
