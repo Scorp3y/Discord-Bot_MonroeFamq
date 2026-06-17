@@ -2,3 +2,5 @@ node_modules/
 .env
 data/*.json
 !data/.gitkeep
+.vs/Discord-Bot_MonroeFamq/FileContentIndex/9ba2087c-e88b-4a5f-95fe-bc8da124dc30.vsidx
+/.vs

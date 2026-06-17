@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { readFileSync } from 'node:fs';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -46,6 +47,29 @@ const CONFIG = {
   serverName: process.env.SERVER_NAME || 'MONROE FAMQ',
   footerText: process.env.FOOTER_TEXT || 'Monroe FamQ • Recruitment System'
 };
+
+const PACKAGE_INFO = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8')
+);
+
+const BOT_STARTED_AT = new Date();
+
+function formatUptime(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  const parts = [];
+
+  if (days) parts.push(`${days} д.`);
+  if (hours) parts.push(`${hours} ч.`);
+  if (minutes) parts.push(`${minutes} мин.`);
+  if (!parts.length) parts.push(`${seconds} сек.`);
+
+  return parts.join(' ');
+}
 
 const REQUIRED_ENV = [
   'DISCORD_TOKEN',
@@ -681,6 +705,43 @@ client.once('ready', () => {
 
 client.on('interactionCreate', async (interaction) => {
   try {
+    if (interaction.isChatInputCommand() && interaction.commandName === 'status') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+        await interaction.reply({
+          content: 'Эту команду может использовать только администратор.',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      const startedTimestamp = Math.floor(BOT_STARTED_AT.getTime() / 1000);
+      const uptime = formatUptime(Date.now() - BOT_STARTED_AT.getTime());
+      const ping = Number.isFinite(client.ws.ping) ? Math.round(client.ws.ping) : 0;
+      const memoryMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+      const onlineStatus = client.isReady() ? '🟢 Online' : '🔴 Offline';
+
+      const embed = new EmbedBuilder()
+        .setColor(client.isReady() ? 0x57F287 : 0xED4245)
+        .setTitle('📡 Статус Monroe FamQ Bot')
+        .setDescription('Текущий статус Discord-бота.')
+        .addFields(
+          { name: 'Статус', value: onlineStatus, inline: true },
+          { name: 'Пинг', value: `${ping} ms`, inline: true },
+          { name: 'Версия', value: `v${PACKAGE_INFO.version || 'unknown'}`, inline: true },
+          { name: 'Последний запуск', value: `<t:${startedTimestamp}:F>\n<t:${startedTimestamp}:R>`, inline: false },
+          { name: 'Работает уже', value: uptime, inline: true },
+          { name: 'Память', value: `${memoryMb} MB`, inline: true }
+        )
+        .setFooter({ text: CONFIG.footerText })
+        .setTimestamp();
+
+      await interaction.reply({
+        embeds: [embed]
+      });
+
+      return;
+    }
+
     if (interaction.isChatInputCommand() && interaction.commandName === 'setup') {
       if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
         await interaction.reply({

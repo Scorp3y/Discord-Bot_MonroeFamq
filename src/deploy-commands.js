@@ -21,9 +21,16 @@ const commands = [
     .setDescription('Отправить панель подачи заявок')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .toJSON(),
+
   new SlashCommandBuilder()
-    .setName('console')
+    .setName('console-ticket')
     .setDescription('Отправить админ-консоль управления заявками')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('status')
+    .setDescription('Показать статус, пинг, версию и время работы бота')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .toJSON()
 ];
@@ -32,11 +39,13 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
 try {
   console.log('⏳ Регистрирую slash-команды...');
+
   await rest.put(
     Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
     { body: commands }
   );
-  console.log('✅ Команды зарегистрированы. Используй /setup и /console на сервере.');
+
+  console.log('✅ Команды зарегистрированы: /setup, /console-ticket, /status');
 } catch (error) {
   console.error('❌ Ошибка регистрации команд:', error);
   process.exit(1);
