@@ -1,6 +1,6 @@
 {
   "name": "monroe-recruitment-bot",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Discord bot for Monroe Family recruitment applications",
   "type": "module",
   "main": "src/index.js",

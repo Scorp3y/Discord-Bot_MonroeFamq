@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { writeFileSync, appendFileSync } from 'node:fs';
+
 import { readFileSync } from 'node:fs';
 import {
   ActionRowBuilder,
@@ -1026,5 +1028,263 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 });
+
+// MONROE_STABILITY_PATCH_V13_START
+
+const MONROE_HEARTBEAT_FILE = '/tmp/monroe-bot-heartbeat.json';
+
+const MONROE_STABILITY_LOG_FILE = '/home/opc/monroe-stability.log';
+
+
+
+function monroeSafeError(error) {
+
+  if (!error) return null;
+
+
+
+  return {
+
+    name: error.name || 'Error',
+
+    message: error.message || String(error),
+
+    stack: error.stack || null,
+
+    code: error.code || null,
+
+    status: error.status || null
+
+  };
+
+}
+
+
+
+function monroeStabilityLog(event, data = {}) {
+
+  const payload = {
+
+    time: new Date().toISOString(),
+
+    event,
+
+    pid: process.pid,
+
+    uptimeSeconds: Math.round(process.uptime()),
+
+    memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+
+    ...data
+
+  };
+
+
+
+  try {
+
+    appendFileSync(MONROE_STABILITY_LOG_FILE, `${JSON.stringify(payload)}\n`, 'utf8');
+
+  } catch (error) {
+
+    console.error('Не удалось записать stability log:', error);
+
+  }
+
+}
+
+
+
+function monroeWriteHeartbeat() {
+
+  const payload = {
+
+    time: new Date().toISOString(),
+
+    timeMs: Date.now(),
+
+    pid: process.pid,
+
+    ready: Boolean(client?.isReady?.()),
+
+    ping: Number.isFinite(client?.ws?.ping) ? Math.round(client.ws.ping) : null,
+
+    uptimeSeconds: Math.round(process.uptime()),
+
+    memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+
+    version: PACKAGE_INFO?.version || 'unknown'
+
+  };
+
+
+
+  try {
+
+    writeFileSync(MONROE_HEARTBEAT_FILE, JSON.stringify(payload, null, 2), 'utf8');
+
+  } catch (error) {
+
+    monroeStabilityLog('heartbeat_write_failed', { error: monroeSafeError(error) });
+
+  }
+
+}
+
+
+
+process.on('unhandledRejection', (reason) => {
+
+  monroeStabilityLog('process_unhandled_rejection', {
+
+    error: monroeSafeError(reason)
+
+  });
+
+
+
+  setTimeout(() => process.exit(1), 500).unref();
+
+});
+
+
+
+process.on('uncaughtException', (error) => {
+
+  monroeStabilityLog('process_uncaught_exception', {
+
+    error: monroeSafeError(error)
+
+  });
+
+
+
+  setTimeout(() => process.exit(1), 500).unref();
+
+});
+
+
+
+client.on('clientReady', () => {
+
+  monroeStabilityLog('discord_client_ready', {
+
+    user: client.user?.tag || null,
+
+    ping: Number.isFinite(client.ws.ping) ? Math.round(client.ws.ping) : null
+
+  });
+
+
+
+  monroeWriteHeartbeat();
+
+});
+
+
+
+client.on('shardDisconnect', (event, shardId) => {
+
+  monroeStabilityLog('discord_shard_disconnect', {
+
+    shardId,
+
+    code: event?.code || null,
+
+    reason: event?.reason || null
+
+  });
+
+});
+
+
+
+client.on('shardReconnecting', (shardId) => {
+
+  monroeStabilityLog('discord_shard_reconnecting', {
+
+    shardId
+
+  });
+
+});
+
+
+
+client.on('shardResume', (shardId, replayedEvents) => {
+
+  monroeStabilityLog('discord_shard_resume', {
+
+    shardId,
+
+    replayedEvents
+
+  });
+
+
+
+  monroeWriteHeartbeat();
+
+});
+
+
+
+client.on('shardError', (error, shardId) => {
+
+  monroeStabilityLog('discord_shard_error', {
+
+    shardId,
+
+    error: monroeSafeError(error)
+
+  });
+
+});
+
+
+
+client.on('error', (error) => {
+
+  monroeStabilityLog('discord_client_error', {
+
+    error: monroeSafeError(error)
+
+  });
+
+});
+
+
+
+client.on('warn', (warning) => {
+
+  monroeStabilityLog('discord_client_warning', {
+
+    warning: String(warning)
+
+  });
+
+});
+
+
+
+setInterval(() => {
+
+  if (client?.isReady?.()) {
+
+    monroeWriteHeartbeat();
+
+  } else {
+
+    monroeStabilityLog('heartbeat_skipped_client_not_ready');
+
+  }
+
+}, 30_000).unref();
+
+// MONROE_STABILITY_PATCH_V13_END
+
+
+
+
 
 client.login(CONFIG.token);
